@@ -2,8 +2,8 @@ name: Sync WebViewTvLive Releases
 
 on:
   schedule:
-    - cron: "0 12 * * *"  # 每天凌晨运行
-  workflow_dispatch:  # 支持手动触发
+    - cron: "0 12 * * *"  # Runs daily at midnight
+  workflow_dispatch:  # Allows manual trigger
 
 jobs:
   sync-releases:
@@ -11,62 +11,70 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for accurate tag checks
 
       - name: Set up Git
         run: |
           git config user.name "klcb2010"
           git config user.email "klcb2010@gmail.com"
 
-      - name: Set up GitHub Token
-        run: echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
-
       - name: Install jq
-        run: sudo apt-get install -y jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Fetch and sync releases from WebViewTvLive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 获取上游所有 Releases（而非仅最新）
-          releases=$(curl -s https://api.github.com/repos/hxh19950701/WebViewTvLive/releases | jq -r '.[] | .tag_name')
+          # Fetch all releases from upstream
+          releases=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/hxh19950701/WebViewTvLive/releases | jq -r '.[] | .tag_name' || {
+              echo "Error fetching releases"; exit 1; })
           echo "Found releases: $releases"
 
           for tag in $releases; do
-            # 检查是否已存在该 Release
+            # Check if release already exists
             if curl -s -H "Authorization: token $GITHUB_TOKEN" \
               https://api.github.com/repos/klcb2010/WebViewTvLive/releases/tags/$tag | grep -q '"id":'; then
               echo "Release $tag already exists, skipping."
               continue
             fi
 
-            # 获取 Release 详细信息
-            release_info=$(curl -s https://api.github.com/repos/hxh19950701/WebViewTvLive/releases/tags/$tag)
-            name=$(echo $release_info | jq -r '.name')
-            body=$(echo $release_info | jq -r '.body')
-            draft=$(echo $release_info | jq -r '.draft')
-            prerelease=$(echo $release_info | jq -r '.prerelease')
+            # Fetch release details
+            release_info=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              https://api.github.com/repos/hxh19950701/WebViewTvLive/releases/tags/$tag || {
+                echo "Error fetching release $tag"; continue; })
+            name=$(echo "$release_info" | jq -r '.name // "Release $tag"')
+            body=$(echo "$release_info" | jq -r '.body // ""')
+            draft=$(echo "$release_info" | jq -r '.draft')
+            prerelease=$(echo "$release_info" | jq -r '.prerelease')
 
-            # 创建 Release
+            # Create release
             echo "Creating release for tag: $tag"
-            release_response=$(curl -s -X POST https://api.github.com/repos/klcb2010/WebViewTvLive/releases \
+            release_response=$(curl -s -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
-              -d "{
-                \"tag_name\": \"$tag\",
-                \"name\": \"$name\",
-                \"body\": \"$body\",
-                \"draft\": $draft,
-                \"prerelease\": $prerelease
-              }")
-            release_id=$(echo $release_response | jq -r '.id')
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/klcb2010/WebViewTvLive/releases \
+              -d "{\"tag_name\": \"$tag\", \"name\": \"$name\", \"body\": \"$body\", \"draft\": $draft, \"prerelease\": $prerelease}" || {
+                echo "Error creating release $tag"; continue; })
+            release_id=$(echo "$release_response" | jq -r '.id // empty')
+            if [ -z "$release_id" ]; then
+              echo "Failed to create release $tag"; continue
+            fi
 
-            # 获取并上传附件
-            assets=$(echo $release_info | jq -r '.assets[].browser_download_url')
+            # Fetch and upload assets
+            assets=$(echo "$release_info" | jq -r '.assets[].browser_download_url')
             for asset in $assets; do
               file_name=$(basename "$asset")
-              echo "Downloading $file_name and uploading to release"
-              curl -L -o "$file_name" -H "Accept: application/octet-stream" "$asset"
-              curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
+              echo "Downloading and uploading asset: $file_name"
+              curl -sL -o "$file_name" -H "Accept: application/octet-stream" "$asset" || {
+                echo "Error downloading asset $file_name"; continue; }
+              curl -s -X POST \
+                -H "Authorization: token $GITHUB_TOKEN" \
                 -H "Content-Type: application/octet-stream" \
                 --data-binary @"$file_name" \
-                "https://uploads.github.com/repos/klcb2010/WebViewTvLive/releases/$release_id/assets?name=$file_name"
-              rm "$file_name"
+                "https://uploads.github.com/repos/klcb2010/WebViewTvLive/releases/$release_id/assets?name=$file_name" || {
+                  echo "Error uploading asset $file_name"; continue; }
+              rm -f "$file_name"
             done
           done
